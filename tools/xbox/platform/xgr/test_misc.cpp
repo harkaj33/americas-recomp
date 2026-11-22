@@ -295,6 +295,86 @@ static void CheckDispatchAfterTerminate() {
   if (ended && completionEnded) g_tq.Close(q);
 }
 
+static void CALLBACK ResetGateAndCount(void* context, bool canceled) {
+  auto* c = static_cast<Counter*>(context);
+  ResetEvent(c->gate);
+  Count(context, canceled);
+}
+
+static void CheckWaiters() {
+  void* q = nullptr;
+  g_tq.Create(kThreadPool, kThreadPool, &q);
+
+  HANDLE autoReset = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  Counter a;
+  Token ta{};
+  Check(g_tq.RegisterWaiter(q, kWork, autoReset, &a, Count, &ta) == S_OK, "XTaskQueueRegisterWaiter registers an auto-reset event");
+  SetEvent(autoReset);
+  Check(WaitCalls(a, 1, 5000) && a.canceled == 0, "XTaskQueueRegisterWaiter invokes the callback when the event is signaled");
+  SetEvent(autoReset);
+  Check(WaitCalls(a, 2, 5000), "XTaskQueueRegisterWaiter invokes the callback again when an auto-reset event is signaled a second time");
+  Sleep(100);
+  Check(a.calls == 2, "XTaskQueueRegisterWaiter invokes the callback once per signal of an auto-reset event");
+  g_tq.UnregisterWaiter(q, ta);
+  SetEvent(autoReset);
+  Sleep(100);
+  Check(a.calls == 2, "XTaskQueueUnregisterWaiter: the callback is no longer invoked when the event is signaled");
+  CloseHandle(autoReset);
+
+  HANDLE manualReset = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  Counter m;
+  Token tm{};
+  g_tq.RegisterWaiter(q, kWork, manualReset, &m, Count, &tm);
+  Check(WaitCalls(m, 5, 5000), "XTaskQueueRegisterWaiter invokes the callback repeatedly while a manual-reset event stays signaled");
+  ResetEvent(manualReset);
+  Sleep(50);
+  int settled = m.calls;
+  Sleep(100);
+  Check(m.calls == settled, "XTaskQueueRegisterWaiter stops repeating once the manual-reset event is reset");
+  g_tq.UnregisterWaiter(q, tm);
+  CloseHandle(manualReset);
+
+  Counter r;
+  r.gate = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  Token tr{};
+  g_tq.RegisterWaiter(q, kWork, r.gate, &r, ResetGateAndCount, &tr);
+  WaitCalls(r, 1, 5000);
+  Sleep(100);
+  Check(r.calls == 1, "XTaskQueueRegisterWaiter invokes the callback once when it resets the manual-reset event itself");
+  g_tq.UnregisterWaiter(q, tr);
+  CloseHandle(r.gate);
+  g_tq.Close(q);
+
+  void* manualQueue = nullptr;
+  g_tq.Create(kManual, kManual, &manualQueue);
+  HANDLE signaled = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  Counter d;
+  Token td{};
+  g_tq.RegisterWaiter(manualQueue, kWork, signaled, &d, Count, &td);
+  bool dispatched = g_tq.Dispatch(manualQueue, kWork, 5000) && g_tq.Dispatch(manualQueue, kWork, 5000) && g_tq.Dispatch(manualQueue, kWork, 5000);
+  Check(dispatched && d.calls == 3, "XTaskQueueRegisterWaiter on a manual queue submits a new callback after each dispatched one while the event stays signaled");
+  g_tq.UnregisterWaiter(manualQueue, td);
+  while (g_tq.Dispatch(manualQueue, kWork, 0)) {
+  }
+  int drained = d.calls;
+  Check(!g_tq.Dispatch(manualQueue, kWork, 100) && d.calls == drained, "XTaskQueueUnregisterWaiter on a manual queue: no callback is submitted afterwards");
+  CloseHandle(signaled);
+
+  void* terminated = nullptr;
+  g_tq.Create(kThreadPool, kThreadPool, &terminated);
+  HANDLE later = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  Counter t;
+  Token tt{};
+  g_tq.RegisterWaiter(terminated, kWork, later, &t, Count, &tt);
+  g_tq.Terminate(terminated, true);
+  SetEvent(later);
+  Sleep(100);
+  Check(t.calls == 0, "XTaskQueueTerminate unregisters the waiters: a later signal invokes nothing");
+  CloseHandle(later);
+  g_tq.Close(terminated);
+  g_tq.Close(manualQueue);
+}
+
 static void CheckComposite() {
   void* q = nullptr;
   g_tq.Create(kManual, kManual, &q);
@@ -525,6 +605,7 @@ int main() {
   CheckManualQueue();
   CheckTermination();
   CheckDispatchAfterTerminate();
+  CheckWaiters();
   CheckComposite();
   CheckThreadPool();
   CheckGameEvent();

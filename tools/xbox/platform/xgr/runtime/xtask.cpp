@@ -53,11 +53,15 @@ struct Monitor {
 };
 
 struct Waiter {
-  Queue* q;
-  PortId port;
-  void* ctx;
-  Callback cb;
-  HANDLE wait = nullptr;
+  Queue* q = nullptr;
+  PortId port = PortId::Work;
+  void* ctx = nullptr;
+  Callback cb = nullptr;
+  HANDLE handle = nullptr;
+  PTP_WAIT wait = nullptr;
+  std::mutex m;
+  bool active = true;
+  std::atomic<long> refs{1};
 };
 
 struct Queue {
@@ -231,9 +235,40 @@ Queue* resolve(Queue* q, bool* borrowed) {
   return GetProcessQueue(&proc) ? proc : nullptr;
 }
 
-VOID CALLBACK waiter_fired(PVOID p, BOOLEAN) {
+void release(Waiter* w) {
+  if (w->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete w;
+}
+
+void CALLBACK waiter_item(void* p, bool canceled) {
   auto* w = static_cast<Waiter*>(p);
-  if (Submit(w->q, w->port, w->ctx, w->cb) != S_OK) w->cb(w->ctx, true);
+  w->cb(w->ctx, canceled);
+  {
+    std::lock_guard<std::mutex> lock(w->m);
+    if (w->active && !canceled) SetThreadpoolWait(w->wait, w->handle, nullptr);
+  }
+  release(w);
+}
+
+VOID CALLBACK waiter_fired(PTP_CALLBACK_INSTANCE, PVOID p, PTP_WAIT, TP_WAIT_RESULT result) {
+  if (result != WAIT_OBJECT_0) return;
+  auto* w = static_cast<Waiter*>(p);
+  w->refs.fetch_add(1, std::memory_order_relaxed);
+  if (Submit(w->q, w->port, w, waiter_item) != S_OK) {
+    w->cb(w->ctx, true);
+    release(w);
+  }
+}
+
+void stop_waiter(Waiter* w) {
+  {
+    std::lock_guard<std::mutex> lock(w->m);
+    w->active = false;
+    SetThreadpoolWait(w->wait, nullptr, nullptr);
+  }
+  WaitForThreadpoolWaitCallbacks(w->wait, TRUE);
+  CloseThreadpoolWait(w->wait);
+  release(w->q);
+  release(w);
 }
 
 std::unique_ptr<Port> make_port(DispatchMode mode, Queue* owner) {
@@ -357,11 +392,7 @@ HRESULT Terminate(Queue* q, bool wait, void* ctx, TerminatedCallback cb) {
     q->terminated = true;
     waiters.swap(q->waiters);
   }
-  for (auto& kv : waiters) {
-    UnregisterWaitEx(kv.second->wait, INVALID_HANDLE_VALUE);
-    release(kv.second->q);
-    delete kv.second;
-  }
+  for (auto& kv : waiters) stop_waiter(kv.second);
   // Cancel items submitted through this queue. Like Microsoft's runtime, cancellations are
   // delivered through the ports (a Manual port needs XTaskQueueDispatch to see them), so
   // XTaskQueueTerminate(wait=true) on a Manual queue must not be called from its only dispatcher.
@@ -431,17 +462,32 @@ HRESULT RegisterWaiter(Queue* q, PortId port, HANDLE h, void* ctx, Callback cb,
                        RegistrationToken* tok) {
   if (!q || !h || !cb || !tok || !valid_port(port)) return E_INVALIDARG;
   if (is_terminated(q)) return E_ABORT;
-  auto* w = new Waiter{q, port, ctx, cb};
-  add_ref(q);
-  // [inferred] One-shot: the callback is queued once when the handle is signaled.
-  if (!RegisterWaitForSingleObject(&w->wait, h, waiter_fired, w, INFINITE, WT_EXECUTEONLYONCE)) {
-    release(q);
+  auto* w = new Waiter();
+  w->q = q;
+  w->port = port;
+  w->ctx = ctx;
+  w->cb = cb;
+  w->handle = h;
+  w->wait = CreateThreadpoolWait(waiter_fired, w, nullptr);
+  if (!w->wait) {
+    HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
     delete w;
-    return HRESULT_FROM_WIN32(GetLastError());
+    return hr;
   }
-  tok->token = g_next_token++;
-  std::lock_guard<std::mutex> lock(q->m);
-  q->waiters[tok->token] = w;
+  add_ref(q);
+  SetThreadpoolWait(w->wait, h, nullptr);
+  uint64_t token = g_next_token++;
+  bool terminated;
+  {
+    std::lock_guard<std::mutex> lock(q->m);
+    terminated = q->terminated;
+    if (!terminated) q->waiters[token] = w;
+  }
+  if (terminated) {
+    stop_waiter(w);
+    return E_ABORT;
+  }
+  tok->token = token;
   return S_OK;
 }
 
@@ -455,9 +501,7 @@ void UnregisterWaiter(Queue* q, RegistrationToken tok) {
     w = it->second;
     q->waiters.erase(it);
   }
-  UnregisterWaitEx(w->wait, INVALID_HANDLE_VALUE);
-  release(w->q);
-  delete w;
+  stop_waiter(w);
 }
 
 HRESULT RegisterMonitor(Queue* q, void* ctx, MonitorCallback cb, RegistrationToken* tok) {
