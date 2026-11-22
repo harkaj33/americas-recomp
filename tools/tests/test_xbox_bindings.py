@@ -102,7 +102,7 @@ class AnalyseTest(unittest.TestCase):
         self.assertEqual(len(nodes(self.analyse(smem(SMEM_X4) + smem(SMEM_X4, 4, 0, 0x40))[0])), 1)
 
     def test_a_pointer_must_use_the_first_dword_of_its_load(self):
-        self.assertEqual(len(nodes(self.analyse(smem(SMEM_X4) + smem(SMEM_X4, 8, 2, 0x40))[0])), 1)
+        self.assertEqual(len(nodes(self.analyse(smem(SMEM_X2, 1) + smem(SMEM_X4, 4, 2, 0x40))[0])), 1)
 
     def test_a_moved_pointer_keeps_the_node(self):
         lines = self.analyse(smem(SMEM_X2) + sop1(S_MOV_B32, 8, 0) + smem(SMEM_X4, 4, 8, 0x40))[0]
@@ -120,13 +120,16 @@ class AnalyseTest(unittest.TestCase):
         self.assertEqual(nodes(self.analyse(smem(SMEM_X4, 4, 30))[0]), [])
 
     def test_a_mesh_stage_reaches_sgpr_39(self):
-        self.assertEqual(nodes(self.analyse(smem(SMEM_X4, 4, 30), bindings.user_sgprs("?"))[0]),
-                         [("node", "0", "user", "30")])
+        self.assertEqual(nodes(self.analyse(smem(SMEM_X4, 4, 38), bindings.user_sgprs("?"))[0]),
+                         [("node", "0", "user", "38")])
+
+    def test_a_mesh_stage_stops_at_sgpr_39(self):
+        self.assertEqual(nodes(self.analyse(smem(SMEM_X4, 4, 40), bindings.user_sgprs("?"))[0]), [])
 
     def test_an_export_half_gets_the_mesh_user_range(self):
-        lines = self.analyse(smem(SMEM_X4, 4, 30) + sopp(S_BARRIER) + sop1(S_SETPC_B64, 0, 0),
+        lines = self.analyse(smem(SMEM_X4, 4, 38) + sopp(S_BARRIER) + sop1(S_SETPC_B64, 0, 0),
                              bindings.user_sgprs("VS"))[0]
-        self.assertEqual(nodes(lines), [("node", "0", "user", "30")])
+        self.assertEqual(nodes(lines), [("node", "0", "user", "38")])
 
     def test_a_jump_without_the_barrier_is_not_an_export_half(self):
         lines = self.analyse(smem(SMEM_X4, 4, 30) + sop1(S_SETPC_B64, 0, 0), bindings.user_sgprs("VS"))[0]
