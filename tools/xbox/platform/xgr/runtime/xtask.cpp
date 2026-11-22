@@ -296,8 +296,8 @@ bool Dispatch(Queue* q, PortId port, uint32_t timeout_ms) {
   Item item;
   {
     std::unique_lock<std::mutex> lock(p->m);
-    if (p->items.empty() && timeout_ms) {
-      auto ready = [p] { return !p->items.empty(); };
+    auto ready = [p, q] { return !p->items.empty() || is_terminated(q); };
+    if (!ready() && timeout_ms) {
       if (timeout_ms == INFINITE)
         p->cv.wait(lock, ready);
       else

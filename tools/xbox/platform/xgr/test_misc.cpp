@@ -233,6 +233,68 @@ static void CheckTermination() {
   g_tq.Close(q);
 }
 
+struct DispatchLoop {
+  void* queue;
+  uint32_t port;
+  uint32_t timeout;
+  std::atomic<int> dispatched{0};
+  HANDLE thread = nullptr;
+};
+static DWORD WINAPI RunDispatchLoop(void* context) {
+  auto* loop = static_cast<DispatchLoop*>(context);
+  while (g_tq.Dispatch(loop->queue, loop->port, loop->timeout)) loop->dispatched++;
+  return 0;
+}
+static void StartDispatchLoop(DispatchLoop* loop) { loop->thread = CreateThread(nullptr, 0, RunDispatchLoop, loop, 0, nullptr); }
+static bool DispatchLoopEnds(DispatchLoop* loop, DWORD ms) {
+  if (!loop->thread || WaitForSingleObject(loop->thread, ms) != WAIT_OBJECT_0) return false;
+  CloseHandle(loop->thread);
+  loop->thread = nullptr;
+  return true;
+}
+static bool WaitCalls(const Counter& c, int calls, DWORD ms) {
+  ULONGLONG until = GetTickCount64() + ms;
+  while (c.calls < calls) {
+    if (GetTickCount64() > until) return false;
+    Sleep(5);
+  }
+  return true;
+}
+
+static void CheckDispatchAfterTerminate() {
+  void* q = nullptr;
+  g_tq.Create(kManual, kManual, &q);
+  Counter c;
+  DispatchLoop loop{q, kWork, INFINITE};
+  StartDispatchLoop(&loop);
+  g_tq.Submit(q, kWork, &c, Count);
+  Check(WaitCalls(c, 1, 5000) && c.canceled == 0, "XTaskQueueDispatch(INFINITE) runs work submitted while it waits");
+  g_tq.Terminate(q, false);
+  bool ended = DispatchLoopEnds(&loop, 5000);
+  Check(ended && loop.dispatched == 1, "XTaskQueueDispatch(INFINITE) blocked on an empty port returns false when the queue is terminated");
+  if (ended) g_tq.Close(q);
+
+  q = nullptr;
+  g_tq.Create(kManual, kManual, &q);
+  Counter pending;
+  g_tq.Submit(q, kWork, &pending, Count);
+  g_tq.Submit(q, kWork, &pending, Count);
+  g_tq.Terminate(q, false);
+  DispatchLoop drain{q, kWork, INFINITE};
+  StartDispatchLoop(&drain);
+  ended = DispatchLoopEnds(&drain, 5000);
+  Check(ended && drain.dispatched == 2 && pending.calls == 2 && pending.canceled == 2,
+        "XTaskQueueDispatch(INFINITE) delivers the callbacks pending at termination as canceled, then returns false");
+  DispatchLoop completion{q, kCompletion, INFINITE};
+  StartDispatchLoop(&completion);
+  bool completionEnded = DispatchLoopEnds(&completion, 5000);
+  Check(completionEnded && completion.dispatched == 0, "XTaskQueueDispatch(INFINITE) on the empty completion port of a terminated queue returns false");
+  ULONGLONG started = GetTickCount64();
+  bool dispatched = g_tq.Dispatch(q, kWork, 3000);
+  Check(!dispatched && GetTickCount64() - started < 1000, "XTaskQueueDispatch with a timeout returns false at once on a terminated, drained queue");
+  if (ended && completionEnded) g_tq.Close(q);
+}
+
 static void CheckComposite() {
   void* q = nullptr;
   g_tq.Create(kManual, kManual, &q);
@@ -462,6 +524,7 @@ int main() {
   g_tq.api = Get("IXThreadingImpl", kThreading);
   CheckManualQueue();
   CheckTermination();
+  CheckDispatchAfterTerminate();
   CheckComposite();
   CheckThreadPool();
   CheckGameEvent();
