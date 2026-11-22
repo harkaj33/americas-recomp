@@ -54,7 +54,7 @@ jobs:
       - run: cmake --build build-xbox
       - name: Python tool tests
         run: |
-          for test in tools/tests/test_xbox_*.py; do
+          for test in tools/tests/test_xbox_*.py tools/xbox/platform/test_*.py; do
             echo "== $test"
             python3 "$test"
           done
